@@ -20,6 +20,7 @@ import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnWebApplication;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.http.HttpStatus;
@@ -38,11 +39,17 @@ import org.springframework.security.oauth2.client.web.OAuth2AuthorizationRequest
 import org.springframework.security.web.server.DelegatingServerAuthenticationEntryPoint;
 import org.springframework.security.web.server.SecurityWebFilterChain;
 import org.springframework.security.web.server.ServerAuthenticationEntryPoint;
+import org.springframework.security.web.server.authentication.DelegatingServerAuthenticationSuccessHandler;
 import org.springframework.security.web.server.authentication.HttpStatusServerEntryPoint;
 import org.springframework.security.web.server.authentication.RedirectServerAuthenticationEntryPoint;
+import org.springframework.security.web.server.authentication.RedirectServerAuthenticationSuccessHandler;
+import org.springframework.security.web.server.authentication.ServerAuthenticationSuccessHandler;
 import org.springframework.security.web.server.authentication.logout.ServerLogoutSuccessHandler;
 import org.springframework.security.web.server.csrf.CookieServerCsrfTokenRepository;
 import org.springframework.security.web.server.util.matcher.MediaTypeServerWebExchangeMatcher;
+import reactor.core.publisher.Flux;
+
+import java.util.List;
 
 import java.util.Set;
 
@@ -73,7 +80,10 @@ public class BffSecurityAutoConfiguration {
     public SecurityWebFilterChain bffSecurityWebFilterChain(
             ServerHttpSecurity http,
             ReactiveClientRegistrationRepository clientRegistrations,
-            BffSecurityProperties properties) {
+            BffSecurityProperties properties,
+            ObjectProvider<BffLoginHook> loginHooks) {
+
+        List<BffLoginHook> hooks = loginHooks.orderedStream().toList();
 
         http
                 .authorizeExchange(exchanges -> {
@@ -87,7 +97,14 @@ public class BffSecurityAutoConfiguration {
                 // Spring enables it automatically only for public clients, but a token-handler BFF is a
                 // confidential client and must still send code_challenge (defence in depth; required when
                 // the IdP enforces PKCE).
-                .oauth2Login(login -> login.authorizationRequestResolver(pkceAuthorizationRequestResolver(clientRegistrations)))
+                .oauth2Login(login -> {
+                    login.authorizationRequestResolver(pkceAuthorizationRequestResolver(clientRegistrations));
+                    // Opt-in post-login hooks (e.g. JIT user reconciliation): run once per login, fail-closed,
+                    // before the redirect. With no hooks, Spring's default success handling is left untouched.
+                    if (!hooks.isEmpty()) {
+                        login.authenticationSuccessHandler(loginSuccessHandler(hooks));
+                    }
+                })
                 // Browser-facing cookie auth needs CSRF; XSRF-TOKEN is readable so the SPA can echo it.
                 .csrf(csrf -> csrf.csrfTokenRepository(CookieServerCsrfTokenRepository.withHttpOnlyFalse()))
                 // RP-initiated logout: clear the session and redirect to the IdP end-session endpoint.
@@ -131,6 +148,19 @@ public class BffSecurityAutoConfiguration {
                 new DefaultServerOAuth2AuthorizationRequestResolver(clientRegistrations);
         resolver.setAuthorizationRequestCustomizer(OAuth2AuthorizationRequestCustomizers.withPkce());
         return resolver;
+    }
+
+    /**
+     * Runs the contributed {@link BffLoginHook}s once (in order), then performs the standard post-login
+     * redirect. A hook error propagates (fail-closed): the redirect is skipped and the login fails rather
+     * than serving a half-provisioned session.
+     */
+    private ServerAuthenticationSuccessHandler loginSuccessHandler(List<BffLoginHook> hooks) {
+        ServerAuthenticationSuccessHandler runHooks = (webFilterExchange, authentication) ->
+                Flux.fromIterable(hooks)
+                        .concatMap(hook -> hook.onLogin(authentication, webFilterExchange.getExchange()))
+                        .then();
+        return new DelegatingServerAuthenticationSuccessHandler(runHooks, new RedirectServerAuthenticationSuccessHandler());
     }
 
     private ServerLogoutSuccessHandler oidcLogoutSuccessHandler(
