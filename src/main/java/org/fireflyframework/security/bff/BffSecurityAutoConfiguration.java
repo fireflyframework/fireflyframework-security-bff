@@ -31,7 +31,10 @@ import org.springframework.security.oauth2.client.ReactiveOAuth2AuthorizedClient
 import org.springframework.security.oauth2.client.oidc.web.server.logout.OidcClientInitiatedServerLogoutSuccessHandler;
 import org.springframework.security.oauth2.client.registration.ReactiveClientRegistrationRepository;
 import org.springframework.security.oauth2.client.web.DefaultReactiveOAuth2AuthorizedClientManager;
+import org.springframework.security.oauth2.client.web.server.DefaultServerOAuth2AuthorizationRequestResolver;
+import org.springframework.security.oauth2.client.web.server.ServerOAuth2AuthorizationRequestResolver;
 import org.springframework.security.oauth2.client.web.server.ServerOAuth2AuthorizedClientRepository;
+import org.springframework.security.oauth2.client.web.OAuth2AuthorizationRequestCustomizers;
 import org.springframework.security.web.server.DelegatingServerAuthenticationEntryPoint;
 import org.springframework.security.web.server.SecurityWebFilterChain;
 import org.springframework.security.web.server.ServerAuthenticationEntryPoint;
@@ -80,9 +83,11 @@ public class BffSecurityAutoConfiguration {
                     exchanges.anyExchange().authenticated();
                 })
                 // Authorization Code + PKCE, server-side. Tokens + principal land in the WebSession
-                // (Redis-backed via Spring Session) — never in the browser.
-                .oauth2Login(login -> {
-                })
+                // (Redis-backed via Spring Session) — never in the browser. PKCE is forced explicitly:
+                // Spring enables it automatically only for public clients, but a token-handler BFF is a
+                // confidential client and must still send code_challenge (defence in depth; required when
+                // the IdP enforces PKCE).
+                .oauth2Login(login -> login.authorizationRequestResolver(pkceAuthorizationRequestResolver(clientRegistrations)))
                 // Browser-facing cookie auth needs CSRF; XSRF-TOKEN is readable so the SPA can echo it.
                 .csrf(csrf -> csrf.csrfTokenRepository(CookieServerCsrfTokenRepository.withHttpOnlyFalse()))
                 // RP-initiated logout: clear the session and redirect to the IdP end-session endpoint.
@@ -114,6 +119,18 @@ public class BffSecurityAutoConfiguration {
                 new DefaultReactiveOAuth2AuthorizedClientManager(clientRegistrations, authorizedClients);
         manager.setAuthorizedClientProvider(provider);
         return manager;
+    }
+
+    /**
+     * Authorization-request resolver that always adds PKCE ({@code code_challenge}, S256). Spring only
+     * enables PKCE automatically for public clients; a confidential token-handler BFF must opt in.
+     */
+    private ServerOAuth2AuthorizationRequestResolver pkceAuthorizationRequestResolver(
+            ReactiveClientRegistrationRepository clientRegistrations) {
+        DefaultServerOAuth2AuthorizationRequestResolver resolver =
+                new DefaultServerOAuth2AuthorizationRequestResolver(clientRegistrations);
+        resolver.setAuthorizationRequestCustomizer(OAuth2AuthorizationRequestCustomizers.withPkce());
+        return resolver;
     }
 
     private ServerLogoutSuccessHandler oidcLogoutSuccessHandler(
