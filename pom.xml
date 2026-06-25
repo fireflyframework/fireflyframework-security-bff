@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>org.fireflyframework</groupId>
+        <artifactId>fireflyframework-parent</artifactId>
+        <version>26.06.02</version>
+        <relativePath/>
+    </parent>
+
+    <!--
+        Dev version, deliberately distinct from the 26.06.02 release so this module coexists in .m2
+        without overwriting the release that every other product consumes. Promoted to a real release
+        once validated.
+    -->
+    <artifactId>fireflyframework-security-bff</artifactId>
+    <version>26.06.03-SNAPSHOT</version>
+    <packaging>jar</packaging>
+
+    <name>Firefly Framework - Security BFF</name>
+    <description>Secure-by-default token-handler BFF: server-side OAuth2 login, session-held tokens,
+        opaque __Host- cookie, per-user authorized-client manager for gateway TokenRelay, cookie-mode
+        CSRF, RP-initiated logout and an XHR-aware authentication entry point. Spring-Cloud-Gateway-agnostic.</description>
+
+    <dependencies>
+        <!-- OAuth2 Login (Authorization Code + PKCE) + the reactive security web stack. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-oauth2-client</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-autoconfigure</artifactId>
+        </dependency>
+        <!-- Reactive web types (ServerWebExchange/WebFilter); provided by the consuming BFF app. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-webflux</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <!-- test -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.projectreactor</groupId>
+            <artifactId>reactor-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.security</groupId>
+            <artifactId>spring-security-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+</project>
