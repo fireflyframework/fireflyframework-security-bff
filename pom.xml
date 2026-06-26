@@ -11,13 +11,8 @@
         <relativePath/>
     </parent>
 
-    <!--
-        Dev version, deliberately distinct from the 26.06.02 release so this module coexists in .m2
-        without overwriting the release that every other product consumes. Promoted to a real release
-        once validated.
-    -->
     <artifactId>fireflyframework-security-bff</artifactId>
-    <version>26.06.03-SNAPSHOT</version>
+    <version>26.06.02</version>
     <packaging>jar</packaging>
 
     <name>Firefly Framework - Security BFF</name>
