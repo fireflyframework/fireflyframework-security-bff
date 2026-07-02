@@ -16,9 +16,11 @@
 
 package org.fireflyframework.security.bff;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnWebApplication;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
@@ -45,8 +47,14 @@ import org.springframework.security.web.server.authentication.RedirectServerAuth
 import org.springframework.security.web.server.authentication.RedirectServerAuthenticationSuccessHandler;
 import org.springframework.security.web.server.authentication.ServerAuthenticationSuccessHandler;
 import org.springframework.security.web.server.authentication.logout.ServerLogoutSuccessHandler;
+import org.springframework.http.HttpMethod;
 import org.springframework.security.web.server.csrf.CookieServerCsrfTokenRepository;
+import org.springframework.security.web.server.util.matcher.AndServerWebExchangeMatcher;
 import org.springframework.security.web.server.util.matcher.MediaTypeServerWebExchangeMatcher;
+import org.springframework.security.web.server.util.matcher.NegatedServerWebExchangeMatcher;
+import org.springframework.security.web.server.util.matcher.OrServerWebExchangeMatcher;
+import org.springframework.security.web.server.util.matcher.ServerWebExchangeMatcher;
+import org.springframework.security.web.server.util.matcher.ServerWebExchangeMatchers;
 import reactor.core.publisher.Flux;
 
 import java.util.List;
@@ -81,7 +89,8 @@ public class BffSecurityAutoConfiguration {
             ServerHttpSecurity http,
             ReactiveClientRegistrationRepository clientRegistrations,
             BffSecurityProperties properties,
-            ObjectProvider<BffLoginHook> loginHooks) {
+            ObjectProvider<BffLoginHook> loginHooks,
+            ObjectProvider<ObjectMapper> objectMapper) {
 
         List<BffLoginHook> hooks = loginHooks.orderedStream().toList();
 
@@ -106,10 +115,29 @@ public class BffSecurityAutoConfiguration {
                     }
                 })
                 // Browser-facing cookie auth needs CSRF; XSRF-TOKEN is readable so the SPA can echo it.
-                .csrf(csrf -> csrf.csrfTokenRepository(CookieServerCsrfTokenRepository.withHttpOnlyFalse()))
+                // With csrf-cookie enabled, use the SPA request handler so the raw cookie value the SPA
+                // echoes in the header validates against the default (XOR) masking.
+                .csrf(csrf -> {
+                    csrf.csrfTokenRepository(CookieServerCsrfTokenRepository.withHttpOnlyFalse());
+                    if (properties.isCsrfCookie()) {
+                        csrf.csrfTokenRequestHandler(new SpaServerCsrfTokenRequestHandler());
+                    }
+                    // Exempt server-to-server callbacks (e.g. OIDC back-channel logout) that carry their
+                    // own signed proof, not a browser cookie: require CSRF for the default unsafe methods
+                    // AND only when the path is not exempt.
+                    if (!properties.getCsrfExemptMatchers().isEmpty()) {
+                        csrf.requireCsrfProtectionMatcher(new AndServerWebExchangeMatcher(
+                                unsafeMethodMatcher(),
+                                new NegatedServerWebExchangeMatcher(ServerWebExchangeMatchers.pathMatchers(
+                                        properties.getCsrfExemptMatchers().toArray(String[]::new)))));
+                    }
+                })
                 // RP-initiated logout: clear the session and redirect to the IdP end-session endpoint.
+                // XHR-aware when firefly.security.bff.xhr-aware-logout=true (200+JSON for fetch).
                 // (OIDC back-channel logout is wired by the consuming app / a later iteration.)
-                .logout(logout -> logout.logoutSuccessHandler(oidcLogoutSuccessHandler(clientRegistrations, properties)))
+                .logout(logout -> logout.logoutSuccessHandler(
+                        logoutSuccessHandler(clientRegistrations, properties,
+                                objectMapper.getIfAvailable(ObjectMapper::new))))
                 // 401 for XHR/API (so the SPA reacts), redirect-to-login only for browser document loads.
                 .exceptionHandling(ex -> ex.authenticationEntryPoint(browserAwareEntryPoint(properties)));
 
@@ -142,6 +170,15 @@ public class BffSecurityAutoConfiguration {
      * Authorization-request resolver that always adds PKCE ({@code code_challenge}, S256). Spring only
      * enables PKCE automatically for public clients; a confidential token-handler BFF must opt in.
      */
+    /** Reproduces Spring Security's default CSRF matcher: any method that is not GET/HEAD/TRACE/OPTIONS. */
+    private static ServerWebExchangeMatcher unsafeMethodMatcher() {
+        return new NegatedServerWebExchangeMatcher(new OrServerWebExchangeMatcher(
+                ServerWebExchangeMatchers.pathMatchers(HttpMethod.GET, "/**"),
+                ServerWebExchangeMatchers.pathMatchers(HttpMethod.HEAD, "/**"),
+                ServerWebExchangeMatchers.pathMatchers(HttpMethod.TRACE, "/**"),
+                ServerWebExchangeMatchers.pathMatchers(HttpMethod.OPTIONS, "/**")));
+    }
+
     private ServerOAuth2AuthorizationRequestResolver pkceAuthorizationRequestResolver(
             ReactiveClientRegistrationRepository clientRegistrations) {
         DefaultServerOAuth2AuthorizationRequestResolver resolver =
@@ -163,12 +200,48 @@ public class BffSecurityAutoConfiguration {
         return new DelegatingServerAuthenticationSuccessHandler(runHooks, new RedirectServerAuthenticationSuccessHandler());
     }
 
+    /**
+     * RP-initiated logout success handler. Opt-in XHR-aware wrapper (200 + {@code {"logoutUrl":...}}
+     * for fetch) when {@code firefly.security.bff.xhr-aware-logout=true}; otherwise the classic 302.
+     */
+    private ServerLogoutSuccessHandler logoutSuccessHandler(
+            ReactiveClientRegistrationRepository clientRegistrations,
+            BffSecurityProperties properties,
+            ObjectMapper objectMapper) {
+        ServerLogoutSuccessHandler oidc = oidcLogoutSuccessHandler(clientRegistrations, properties);
+        return properties.isXhrAwareLogout()
+                ? new XhrAwareLogoutSuccessHandler(oidc, objectMapper)
+                : oidc;
+    }
+
     private ServerLogoutSuccessHandler oidcLogoutSuccessHandler(
             ReactiveClientRegistrationRepository clientRegistrations, BffSecurityProperties properties) {
         OidcClientInitiatedServerLogoutSuccessHandler handler =
                 new OidcClientInitiatedServerLogoutSuccessHandler(clientRegistrations);
         handler.setPostLogoutRedirectUri(properties.getPostLogoutRedirectUri());
         return handler;
+    }
+
+    /**
+     * Translates a dead-session token failure from the gateway {@code TokenRelay} into a clean 401
+     * (XHR) / 302-to-login (browser) with session invalidation. Opt-in and overridable.
+     */
+    @Bean
+    @ConditionalOnMissingBean
+    @ConditionalOnProperty(prefix = "firefly.security.bff", name = "refresh-failure-401", havingValue = "true")
+    public BffRefreshTokenFailureWebFilter bffRefreshTokenFailureWebFilter(BffSecurityProperties properties) {
+        return new BffRefreshTokenFailureWebFilter(properties);
+    }
+
+    /**
+     * Renders the deferred CSRF token so the {@code XSRF-TOKEN} cookie reaches the browser (required for
+     * a SPA to call CSRF-protected endpoints such as {@code POST /logout}). Opt-in and overridable.
+     */
+    @Bean
+    @ConditionalOnMissingBean
+    @ConditionalOnProperty(prefix = "firefly.security.bff", name = "csrf-cookie", havingValue = "true")
+    public CsrfCookieWebFilter csrfCookieWebFilter() {
+        return new CsrfCookieWebFilter();
     }
 
     private ServerAuthenticationEntryPoint browserAwareEntryPoint(BffSecurityProperties properties) {
