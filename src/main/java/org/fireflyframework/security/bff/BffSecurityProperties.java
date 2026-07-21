@@ -77,6 +77,18 @@ public class BffSecurityProperties {
      */
     private boolean csrfCookie = false;
 
+    /**
+     * When set, a failure raised by a {@link BffLoginHook} during the OIDC callback (a fail-closed
+     * rejection, e.g. tenant resolution) redirects the browser here instead of rendering the raw error.
+     * Because the callback is always a full-page navigation, the SPA otherwise never boots and cannot
+     * show the error. The value is a URI template with a {@code {code}} placeholder, substituted with the
+     * error's machine-readable code — the same identifier the API surfaces as {@code extensions.code} in
+     * problem+json — so the SPA keys errors by a single vocabulary regardless of transport. Each product
+     * sets its own SPA route, e.g. {@code /login?error={code}} or {@code /error/tenant?code={code}}.
+     * Empty by default: hook failures keep propagating as an error response.
+     */
+    private String loginErrorRedirectUri;
+
     public String getRegistrationId() {
         return registrationId;
     }
@@ -131,5 +143,13 @@ public class BffSecurityProperties {
 
     public void setCsrfCookie(boolean csrfCookie) {
         this.csrfCookie = csrfCookie;
+    }
+
+    public String getLoginErrorRedirectUri() {
+        return loginErrorRedirectUri;
+    }
+
+    public void setLoginErrorRedirectUri(String loginErrorRedirectUri) {
+        this.loginErrorRedirectUri = loginErrorRedirectUri;
     }
 }

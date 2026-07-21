@@ -41,7 +41,8 @@ import org.springframework.security.oauth2.client.web.OAuth2AuthorizationRequest
 import org.springframework.security.web.server.DelegatingServerAuthenticationEntryPoint;
 import org.springframework.security.web.server.SecurityWebFilterChain;
 import org.springframework.security.web.server.ServerAuthenticationEntryPoint;
-import org.springframework.security.web.server.authentication.DelegatingServerAuthenticationSuccessHandler;
+import org.springframework.security.web.server.DefaultServerRedirectStrategy;
+import org.springframework.security.web.server.ServerRedirectStrategy;
 import org.springframework.security.web.server.authentication.HttpStatusServerEntryPoint;
 import org.springframework.security.web.server.authentication.RedirectServerAuthenticationEntryPoint;
 import org.springframework.security.web.server.authentication.RedirectServerAuthenticationSuccessHandler;
@@ -56,6 +57,9 @@ import org.springframework.security.web.server.util.matcher.OrServerWebExchangeM
 import org.springframework.security.web.server.util.matcher.ServerWebExchangeMatcher;
 import org.springframework.security.web.server.util.matcher.ServerWebExchangeMatchers;
 import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+
+import java.net.URI;
 
 import java.util.List;
 
@@ -111,7 +115,7 @@ public class BffSecurityAutoConfiguration {
                     // Opt-in post-login hooks (e.g. JIT user reconciliation): run once per login, fail-closed,
                     // before the redirect. With no hooks, Spring's default success handling is left untouched.
                     if (!hooks.isEmpty()) {
-                        login.authenticationSuccessHandler(loginSuccessHandler(hooks));
+                        login.authenticationSuccessHandler(loginSuccessHandler(hooks, properties));
                     }
                 })
                 // Browser-facing cookie auth needs CSRF; XSRF-TOKEN is readable so the SPA can echo it.
@@ -189,15 +193,49 @@ public class BffSecurityAutoConfiguration {
 
     /**
      * Runs the contributed {@link BffLoginHook}s once (in order), then performs the standard post-login
-     * redirect. A hook error propagates (fail-closed): the redirect is skipped and the login fails rather
-     * than serving a half-provisioned session.
+     * redirect. A hook error is fail-closed (the login fails rather than serving a half-provisioned
+     * session): by default it propagates as an error response, but when
+     * {@code firefly.security.bff.login-error-redirect-uri} is set the browser is redirected there
+     * instead — with {@code {code}} substituted by the error's machine-readable code — so a full-page
+     * OIDC callback can hand a bootable SPA route the failure reason (see {@link BffLoginHook}).
      */
-    private ServerAuthenticationSuccessHandler loginSuccessHandler(List<BffLoginHook> hooks) {
-        ServerAuthenticationSuccessHandler runHooks = (webFilterExchange, authentication) ->
+    private ServerAuthenticationSuccessHandler loginSuccessHandler(List<BffLoginHook> hooks,
+                                                                   BffSecurityProperties properties) {
+        ServerAuthenticationSuccessHandler postLoginRedirect = new RedirectServerAuthenticationSuccessHandler();
+        ServerRedirectStrategy redirectStrategy = new DefaultServerRedirectStrategy();
+        return (webFilterExchange, authentication) ->
                 Flux.fromIterable(hooks)
                         .concatMap(hook -> hook.onLogin(authentication, webFilterExchange.getExchange()))
-                        .then();
-        return new DelegatingServerAuthenticationSuccessHandler(runHooks, new RedirectServerAuthenticationSuccessHandler());
+                        .then(Mono.defer(() ->
+                                postLoginRedirect.onAuthenticationSuccess(webFilterExchange, authentication)))
+                        .onErrorResume(error -> {
+                            String template = properties.getLoginErrorRedirectUri();
+                            if (template == null || template.isBlank()) {
+                                return Mono.error(error); // fail-closed: propagate (rendered as problem+json)
+                            }
+                            URI location = URI.create(template.replace("{code}", errorCode(error)));
+                            return redirectStrategy.sendRedirect(webFilterExchange.getExchange(), location);
+                        });
+    }
+
+    /**
+     * Best-effort machine-readable code for a hook failure, matching the API's {@code extensions.code}.
+     * Firefly's {@code BusinessException} (fireflyframework-web) exposes {@code getCode()}; read it
+     * reflectively so this leaf module needn't depend on the web/error layer. Walks the cause chain and
+     * falls back to a generic code for uncoded errors.
+     */
+    private static String errorCode(Throwable error) {
+        for (Throwable t = error; t != null; t = t.getCause()) {
+            try {
+                Object code = t.getClass().getMethod("getCode").invoke(t);
+                if (code instanceof String s && !s.isBlank()) {
+                    return s;
+                }
+            } catch (ReflectiveOperationException ignored) {
+                // not a coded exception — keep walking the cause chain
+            }
+        }
+        return "LOGIN_FAILED";
     }
 
     /**
